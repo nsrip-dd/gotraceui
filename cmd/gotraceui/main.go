@@ -5,7 +5,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"image"
+	"image/color"
 	"io"
 	"log"
 	"os"
@@ -22,6 +24,7 @@ import (
 	"unicode"
 
 	"honnef.co/go/gotraceui/cmd/gotraceui/assets"
+	mycolor "honnef.co/go/gotraceui/color"
 	ourfont "honnef.co/go/gotraceui/font"
 	"honnef.co/go/gotraceui/gesture"
 	"honnef.co/go/gotraceui/layout"
@@ -971,7 +974,114 @@ func (mwin *MainWindow) Run(win *app.Window) error {
 						mwin.debugWindow.cvY.addValue(gtx.Now, float64(mwin.canvas.y))
 
 						var dims layout.Dimensions
+
+						// For this combination of lightness and chroma, all hues are representable in sRGB, with enough
+						// room to adjust the lightness in both directions for varying shades.
+						baseLightness := float32(0.699)
+						baseChroma := float32(0.103)
+						hueStep := float32(20)
+
 						if mwin.panel == nil {
+							fg := &theme.FlameGraph{
+								Color: func(level, idx int, f theme.Frame) color.NRGBA {
+									const cRuntime = 0xb400d7ff // oklch(56.39% 0.272 318.89)
+									const cStdlib = 0xFFB300FF  // oklch(81.79% 0.1705233575429752 77.9481021312874)
+									const cMain = 0x007D34FF    // oklch(51.67% 0.13481202013716384 152.37558843925763)
+
+									var c color.NRGBA
+									if strings.HasPrefix(f.Name, "runtime.") || strings.HasPrefix(f.Name, "runtime/") || !strings.Contains(f.Name, ".") {
+										c = rgba(cRuntime)
+									} else {
+										slashIdx := strings.Index(f.Name, "/")
+										if strings.HasPrefix(f.Name, "main.") {
+											c = rgba(cMain)
+										} else if slashIdx == -1 {
+											// No slash means it has to be in the standard library
+											c = rgba(cStdlib)
+										} else if !strings.Contains(f.Name[:slashIdx], ".") {
+											// No dot in the first path element means it has to be in the standard library
+											c = rgba(cStdlib)
+										} else {
+											var pkg string
+											if strings.HasPrefix(f.Name, "main.") {
+												// XXX this is impossible, right?
+												pkg = "main"
+											} else {
+												last := strings.LastIndex(f.Name, "/")
+												dot := strings.Index(f.Name[last:], ".")
+												pkg = f.Name[:last+dot]
+											}
+
+											// Select color by hashing the import path
+											//
+											// OPT(dh): use unsafe conversion to []byte
+											h := fnv.New64()
+											h.Write([]byte(pkg))
+											sum := h.Sum64()
+
+											hue := hueStep * float32(sum%uint64(360.0/hueStep))
+
+											mc := mycolor.Oklch{
+												L:     baseLightness,
+												C:     baseChroma,
+												H:     hue,
+												Alpha: 1.0,
+											}
+											c = color.NRGBAModel.Convert(mc.MapToSRGBGamut().SRGB()).(color.NRGBA)
+										}
+									}
+
+									mc := mycolor.SRGB{
+										R: float32(c.R) / 255.0,
+										G: float32(c.G) / 255.0,
+										B: float32(c.B) / 255.0,
+										A: float32(c.A) / 255.0,
+									}.LinearSRGB().Oklab().Oklch()
+
+									mod := 10
+									oldMax := float32(mod)
+									newMin := float32(-0.05)
+									newMax := float32(0.12)
+
+									// Mapping from index to color adjustments. The adjustments are sorted to maximize
+									// the differences between neighboring spans.
+									offsets := [...]float32{4, 9, 3, 8, 2, 7, 1, 6, 0, 5}
+									v := offsets[idx%mod]
+
+									delta := (v/oldMax)*(newMax-newMin) + newMin
+
+									mc.L += delta
+									if mc.L < 0 {
+										mc.L = 0
+									}
+									if mc.L > 1 {
+										mc.L = 1
+									}
+
+									c = color.NRGBAModel.Convert(mc.MapToSRGBGamut().SRGB()).(color.NRGBA)
+
+									return c
+								},
+							}
+							for _, samples := range mwin.trace.CPUSamples {
+								for _, sample := range samples {
+									stack := mwin.trace.Stacks[mwin.trace.Event(sample).StkID]
+									var frames theme.Sample
+									for i := len(stack) - 1; i >= 0; i-- {
+										fn := mwin.trace.PCs[stack[i]].Fn
+										frames = append(frames, theme.Frame{
+											Name: fn,
+										})
+									}
+
+									fg.AddSample(frames)
+								}
+							}
+
+							fg.Compute()
+
+							gtx.Constraints.Min = gtx.Constraints.Max
+							return fg.Layout(win, gtx)
 							dims = mwin.canvas.Layout(win, gtx)
 						} else {
 							dims = theme.Resize(win.Theme, &resize).Layout(win, gtx, mwin.canvas.Layout, mwin.panel.Layout)
@@ -1537,7 +1647,7 @@ func loadTrace(f io.Reader, p progresser, cv *Canvas) (loadTraceResult, error) {
 	}
 
 	// We no longer need this.
-	tr.CPUSamples = nil
+	// tr.CPUSamples = nil
 
 	end := tr.Events[len(tr.Events)-1].Ts
 
